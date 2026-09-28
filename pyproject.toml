@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polarys"
+version = "0.1.0"
+description = "POLARYS core: signed records, RFC 6962 Merkle trees, hash-chained blocks, RFC 3161 timestamps and verifiable receipts"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42",
+    "httpx>=0.27",
+    "click>=8.1",
+]
+
+[project.scripts]
+logverify = "polarys.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
