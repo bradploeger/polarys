@@ -162,8 +162,9 @@ class ClassTests(unittest.TestCase):
         self.assertEqual(self.reg.classify("upload", "tax_returns").id, "tax_returns")
         with self.assertRaises(RetentionError):
             self.reg.classify("api")
+        self.assertEqual(self.reg.classify("api", "tax_returns").id, "tax_returns")
         with self.assertRaises(RetentionError):
-            self.reg.classify("api", "tax_returns")  # uploads only
+            self.reg.classify("syslog_relay", "tax_returns")  # unknown source
 
     def test_leap_day(self):
         self.assertEqual(add_years(datetime(2028, 2, 29, tzinfo=timezone.utc), 7).day, 28)

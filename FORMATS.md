@@ -1,5 +1,7 @@
 # POLARYS formats (version 1)
 
+The ledger schema is in `src/polarys/db/schema.py`.
+
 Conventions: hashes are lowercase hex; signatures, keys, tokens and payloads are standard padded base64; times
 are UTC RFC 3339 with microseconds (`2026-09-26T19:40:00.000000Z`); JSON that is signed or hashed is
 canonicalized with RFC 8785 (JCS). `||` is byte concatenation.
@@ -57,15 +59,28 @@ Signed record: `{"envelope": …, "signature": "<base64>", "key_id": "<same as s
  "submission_sha256": "SHA-256(raw sha256 of document 0 || document 1 || …)"}
 ```
 
-## Stored record object (`records/<yyyy>/<mm>/<dd>/<interval_id>/<record_id>.bin`)
+## Stored objects
+
+Record: `records/<yyyy>/<mm>/<dd>/<interval_id>/<record_id>.bin` (date of the interval's opening)
 
 ```json
 {"v": 1, "alg": "A256GCM", "dek_id": "<interval_id>/<class>", "nonce": "<base64 12 bytes>",
- "ciphertext": "<base64>", "record_id": "…", "leaf_hash": "<hex>", "block_id": 7}
+ "ciphertext": "<base64>", "record_id": "…", "leaf_hash": "<hex>"}
 ```
 
 Plaintext is `JCS(signed record)`. Additional authenticated data is `UTF-8(record_id) || leaf_hash (32 bytes)`.
-Wrapped DEKs live at `keys/dek/<interval_id>/<class>.json` as `{"dek_id", "kek_id", "wrapped"}`.
+
+Document `n` of a business submission: `records/…/<record_id>/<n>.bin`, same shape plus `"document_index": n`.
+Plaintext is the raw file; AAD is `UTF-8(record_id) || leaf_hash || "/document/" || n`, so documents cannot be
+swapped between records or positions.
+
+Interval ids are the UTC time the interval opened, `YYYYmmddTHHMMSS.mmmZ`. Data keys are generated per interval
+and record class, wrapped with the KEK (RFC 3394), and kept in the ledger's `data_keys` table (Phase 1's demo
+directory layout also writes them to `keys/dek/<interval_id>/<class>.json`).
+
+S3 objects are written with `If-None-Match: *`, `Content-MD5`, and either
+`x-amz-object-lock-mode: COMPLIANCE` + `x-amz-object-lock-retain-until-date` (fixed retention) or
+`x-amz-object-lock-legal-hold: ON` (event-based or indefinite retention).
 
 ## Merkle tree
 

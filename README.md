@@ -1,95 +1,161 @@
-# POLARYS — Phase 1 core library
+# POLARYS
 
 **P**ermanent **O**bservability and **L**ogging **A**rchive for **R**ecords and **Y**ielding **S**ystems.
 
-Phase 1 is the cryptographic core that every later component (ingest API, syslog listener, sealer, receipt
-service) is built on, plus `logverify`, the offline verifier that auditors and submitters use to check
-evidence without trusting the operator.
+| Phase | Status | Contents |
+| --- | --- | --- |
+| 1 | done | Core cryptography and formats, `logverify` offline verifier |
+| 2 | done | REST API, ingest pipeline, PostgreSQL ledger, local and S3 object stores, `polarys` admin CLI |
+| 3 | next | 5-minute sealer service, RFC 3161 anchoring, receipt delivery (webhook and polling) |
+| 4 | | Syslog listener, upload page, Windows agent |
+| 5 | | OpenSearch indexing and search, roles, retention jobs, re-timestamping, Docker Compose |
 
-## What is in this phase
-
-| Module | Purpose |
-| --- | --- |
-| `jcs` | RFC 8785 JSON canonicalization (the bytes that are signed and hashed) |
-| `keys` | `KeyProvider` interface; local provider with Ed25519 record and block keys and an AES-256 KEK; public key ring |
-| `cipher` | AES-256-GCM record encryption with one data key per 5-minute interval and record class |
-| `records` | Record envelope, submitter identity (device FQDN or user UPN), signing, leaf hashes |
-| `classes` | The 16 initial record classes and their retention rules |
-| `manifest` | Multi-document business submissions (one submission = one record) |
-| `merkle` | RFC 6962 Merkle tree, inclusion proofs, compact range |
-| `blocks` | Block headers, sealer signatures, block hashes, chain verification |
-| `tsa` | RFC 3161 requests, responses and token verification; client that tries Sectigo, DigiCert, Apple, Microsoft ACS, FreeTSA in order |
-| `receipts` | Submitter receipts and their verification |
-| `sealing` | Seal an interval into a timestamped block; write the object-store layout to a directory |
-| `devtsa` | Local RFC 3161 TSA for tests and demos only |
-| `cli` | `logverify` |
-
-Dependencies: `cryptography`, `httpx`, `click`. ASN.1 for RFC 3161 is handled by the small built-in DER codec,
-so there is no dependency on an ASN.1 library.
-
-## Install and test
+## Quick start (development: SQLite ledger, local object store)
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .
-cd tests && python -m unittest -v        # 54 tests; OpenSSL interop tests run when `openssl` is on PATH
-```
+pip install -e .                      # add [postgres] for psycopg in production
 
-## Try it
+export POLARYS_KEY_PASSPHRASE='choose a long passphrase'
+polarys keys init                     # record key, block key, KEK in ./keystore
+polarys init-db                       # ./polarys-ledger.db, first open interval
+polarys client add --user controller@contoso.com --name "Controller" --role records_manager
+polarys serve                         # http://127.0.0.1:8080
+```
 
 ```bash
-logverify demo demo                       # 3 sealed blocks, 2 receipts, dev TSA
-cd demo
-logverify chain store --keys log-keys.json --tsa-ca dev-tsa-root.pem
-logverify receipt store/receipts/<id>.json --keys log-keys.json --tsa-ca dev-tsa-root.pem \
-    --document documents/form-1120-2025.pdf --document documents/schedule-l.pdf --document documents/signature-page.pdf
-logverify tsa-check                       # live test request to each of the five public TSAs
+TOKEN=plk_…   # printed once by `client add`
+curl -s -X POST http://127.0.0.1:8080/v1/records \
+  -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: INV-10442" \
+  -d '{"record_class":"sales_invoices","data":{"invoice":"INV-10442","amount":"1250.00"}}'
 ```
 
-`logverify receipt` walks the proof step by step:
+## Production configuration
 
-1. record signature (Ed25519, record key)
-2. leaf hash recomputed from the signed record
-3. Merkle inclusion proof leads to the block's `merkle_root`, and `tree_size` equals `entry_count`
-4. block hash recomputed and sealer signature verified (block key)
-5. RFC 3161 token covers the block hash; with `--tsa-ca`, the TSA certificate chains to that root
-6. receipt signature
-7. for business submissions, the manifest is consistent and each `--document` matches a listed hash
+All settings are environment variables prefixed `POLARYS_` (or a `.env` file).
 
-Without `--keys`, the server keys embedded in the receipt are used and a warning says so. Without `--tsa-ca`, the
-TSA signature is checked but not its chain to a trusted root. For production verification, pass both.
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///polarys-ledger.db` | `postgresql://user:pass@host:5432/polarys?sslmode=require` in production |
+| `DB_POOL_SIZE` | 8 | connections per API process |
+| `KEYSTORE_DIR` | `keystore` | from `polarys keys init` |
+| `KEY_PASSPHRASE` / `KEY_PASSPHRASE_FILE` | none | one is required |
+| `STORE` | `local` | `local` or `s3` |
+| `LOCAL_STORE_DIR` | `objects` | local store root |
+| `SPOOL_DIR` | `spool` | objects are spooled here when the store is unreachable; empty to disable |
+| `S3_BUCKET`, `S3_REGION` | none, `us-east-1` | bucket must have Object Lock enabled |
+| `S3_ENDPOINT_URL` | none (AWS) | e.g. `http://minio:9000` for MinIO; uses path-style addressing |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_SESSION_TOKEN` | `AWS_*` env vars | static or STS credentials |
+| `S3_PREFIX` | empty | key prefix inside the bucket |
+| `S3_OBJECT_LOCK` | true | send retention / legal-hold headers |
+| `MAX_RECORD_BYTES` | 1 MiB | one log record payload |
+| `MAX_SUBMISSION_BYTES` | 50 MiB | all documents of one business submission |
+| `MAX_REQUEST_BYTES` | 64 MiB | request body |
+| `MAX_BATCH` / `TX_BATCH` | 1000 / 500 | records per batch request / per database transaction |
+| `TRUSTED_PROXIES` | none | JSON list of CIDRs whose `X-Forwarded-For` is trusted |
+| `CLIENT_CACHE_SECONDS` | 30 | API-key cache; a revoked key stops working within this time |
 
-## What has been verified
+Run several API processes against one PostgreSQL ledger (`polarys serve --workers 4`, or several containers).
+SQLite mode is single-process.
 
-* Merkle roots and proofs match the Certificate Transparency RFC 6962 test vectors and a reference recursive
-  implementation for every tree size from 1 to 69, plus 127, 128, 129 and 1,000.
-* Canonical JSON matches the RFC 8785 examples.
-* Tokens from the development TSA pass `openssl ts -verify`, and tokens issued by OpenSSL's own TSA pass
-  `verify_token`, so the RFC 3161 code interoperates with an independent implementation in both directions.
-* Tamper tests: altered envelopes, header fields, leaves, proofs, tokens, swapped or deleted blocks, a block
-  re-signed with an attacker's key, and a block rewritten with the operator's own key all fail verification.
+## REST API
 
-**Not yet verified here:** tokens from the five public TSAs. This build environment's network policy blocks
-them (HTTP 403 for all five). Run `logverify tsa-check` on a machine with internet access to confirm; the client
-accepts any RFC 3161 compliant token, and the verifier supports RSA (PKCS#1 v1.5 and PSS), ECDSA and Ed25519 TSA
-signatures with ESS signing-certificate v1 or v2.
+Authentication: `Authorization: Bearer plk_<key id>.<secret>`. Each key belongs to one submitter identity,
+a user UPN or a device FQDN, which is written into every record it submits. Keys may be limited to record
+classes (`--class`) and source types (`--source windows_event` for Windows agents).
 
-## Design decisions made during implementation
+| Method | Path | Result |
+| --- | --- | --- |
+| POST | `/v1/records` | 201 acknowledgement; 200 on an idempotent replay; 409 if the `Idempotency-Key` was used for a different body |
+| POST | `/v1/records:batch` | 200 with a result per record (up to 1,000); invalid records do not block the rest |
+| GET | `/v1/records/{id}` | status (`committed`, `sealed`, `anchored`, `receipted`), block and leaf index |
+| GET | `/v1/records/{id}/receipt` | 202 with `Retry-After` until the record's block is anchored, then 200 with the receipt |
+| GET | `/v1/blocks/latest`, `/v1/blocks/{id}` | block header, hash and timestamp token (auditor role) |
+| GET | `/.well-known/log-keys.json` | public keys for verification (no authentication) |
+| GET | `/healthz`, `/readyz` | liveness; readiness including database and spool status |
 
-* **Block hash covers the sealer signature.** `block_hash = SHA-256(JCS(header))` where the header includes
-  `sealer_signature` and `signing_key_id`. The TSA token therefore also fixes which key sealed the block.
-* **Receipts are signed with the block key.** The receipt signature only makes the bundle tamper-evident; the
-  evidence is the proof chain.
-* **Event-based retention** (employee separation, policy expiry, and so on) is signed as a `retention_rule` with
-  `retain_until = null`; the trigger event and lock-date update arrive in Phase 5.
-* **Stored record objects carry `record_id`, `leaf_hash` and `block_id` in the clear.** These are already public
-  in proofs, and the AES-GCM additional data binds the ciphertext to them.
-* **Device identity rejects bare IP addresses.** A device must present an FQDN whose top-level label contains a letter.
+A record body carries exactly one of:
 
-## Next phases
+| Field | Stored as |
+| --- | --- |
+| `data` | any JSON value, stored as canonical JSON (`application/json`) |
+| `text` | UTF-8 text |
+| `payload_base64` | raw bytes, with optional `content_type` |
+| `documents` | 1 to 100 files `{name, content_type, data_base64}`: one record whose payload is a signed manifest; each file is encrypted and stored separately |
 
-Phase 2 adds the REST API, the ingest pipeline, the PostgreSQL ledger and the local and S3 stores, built on
-`records`, `cipher` and `sealing.DirectoryStore`'s layout. Phase 3 turns `sealing.seal` into the 5-minute sealer
-service with the Postgres advisory-lock leader election and webhook and polling receipt delivery.
+plus `record_class` (required except for Windows events), optional `title`, `attributes` (for example
+`severity`, `security`), `client_origin` and, in batches, a per-record `idempotency_key`.
+`attributes.permanent` and `attributes.exposure_record` lengthen retention and need the `records_manager` role.
+
+The acknowledgement contains `record_id`, `leaf_hash`, `signature`, `signing_key_id`, `record_class`,
+`retention_rule`, `retain_until`, `interval_id` and `expected_seal_after`, and, for document submissions, the
+`manifest`. Errors are `{"error": {"code", "message", "details"?}}`.
+
+## Guarantees
+
+* **An acknowledgement means the record is durable.** It is sent only after the encrypted objects are written
+  (or fsynced to the spool) and the ledger row has committed.
+* **Every record lands in exactly one interval, and a closed interval never changes.** Ingest transactions
+  share-lock the open interval; the sealer's close waits for them and opens the next interval atomically. This
+  replaces the 2-second grace period in the original design and is tested with concurrent writers on PostgreSQL.
+* **The object store never sees plaintext.** Records are AES-256-GCM encrypted with a data key per interval and
+  record class, and each ciphertext is bound to its record id, leaf hash and (for documents) position.
+* **Objects are written once.** Local files are created with hard links and made read-only; S3 writes use
+  `If-None-Match: *` and Object Lock: COMPLIANCE retention to `retain_until`, or a legal hold for event-based and
+  indefinite retention until the triggering event sets a date (Phase 5).
+* **Object store outages do not stop ingest.** Transient failures spool objects locally; `polarys spool drain`
+  uploads them and marks the records `stored`. Authentication and configuration errors are not spooled, so they
+  surface immediately.
+
+## Tests
+
+```bash
+cd tests && python -m unittest                  # SQLite and pure-unit tests
+POLARYS_TEST_PG_DSN='postgresql://postgres@/postgres?host=/run/postgresql' python -m unittest   # adds PostgreSQL
+```
+
+114 tests. With PostgreSQL enabled, every ledger, ingest and API test runs on both SQLite and PostgreSQL 16.
+They include the RFC 6962, RFC 8785 and AWS Signature V4 reference vectors; RFC 3161 interop with OpenSSL in both
+directions; tamper tests; and concurrent ingest while intervals are closed. They also cover store outage
+and drain, rolled-back data keys, idempotency, permissions, and API ingest through to a sealed block and
+a receipt verified with `verify_receipt`.
+
+### Load test
+
+`tools/loadtest.py` against one `polarys serve` process on a 2-CPU container, PostgreSQL 16 and the local store:
+
+| Load | Records | Errors | p50 | p99 |
+| --- | --- | --- | --- | --- |
+| 50 records/s, single-record requests (the spec's peak) | 1,000 | 0 | 6.5 ms | 11.4 ms |
+| 150 records/s, single-record requests | 2,250 | 0 | 4.8 ms | 12.4 ms |
+| batches of 500 | 5,000 | 0 | 962 ms per batch | 521 records/s sustained |
+
+S3 adds one network round trip per object; expect p99 to be dominated by the S3 PUT latency.
+
+## Offline verification (Phase 1)
+
+```bash
+logverify demo demo && cd demo
+logverify chain store --keys log-keys.json --tsa-ca dev-tsa-root.pem
+logverify receipt store/receipts/<id>.json --keys log-keys.json --tsa-ca dev-tsa-root.pem --document documents/…
+logverify tsa-check                       # live request to each of the five public TSAs
+```
+
+`logverify receipt` checks the record signature, leaf hash, Merkle inclusion, block hash and sealer signature,
+the RFC 3161 token, the receipt signature and, for document submissions, each file against the manifest.
+
+## Implementation notes
+
+* **Starlette instead of FastAPI.** FastAPI could not be installed in the build environment; the API uses
+  Starlette and pydantic, which FastAPI is built on. There is no auto-generated OpenAPI page yet.
+* **PostgreSQL driver.** psycopg 3 is used when installed (`pip install -e .[postgres]`, recommended). Otherwise
+  the built-in `polarys.db.pgwire` client is used; it supports TLS and SCRAM-SHA-256 and is what the test suite
+  ran against, because psycopg could not be installed here. Force one with `?driver=psycopg` or `?driver=pgwire`.
+* **S3 without boto3.** `polarys.store.s3` signs requests itself (Signature V4, checked against AWS's published
+  examples). Instance-profile and SSO credentials are not supported yet; use static keys or STS environment
+  variables. It has been tested against a simulated S3 service, not yet against AWS or MinIO.
+* **All business record classes accept API submissions.** Phase 1 limited legal, tax, insurance and similar
+  classes to web uploads; per-key `--class` limits now control who may submit what.
+* Block hash covers the sealer signature; receipts are signed with the block key; device identities must be FQDNs.
 
 See `FORMATS.md` for byte-level formats.

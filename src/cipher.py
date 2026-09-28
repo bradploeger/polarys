@@ -58,3 +58,8 @@ def decrypt(dek: DataKey, obj: dict, aad: bytes) -> bytes:
     if obj.get("alg") != "A256GCM" or obj.get("dek_id") != dek.dek_id:
         raise ValueError("object was not encrypted with this data key")
     return AESGCM(dek.key).decrypt(b64d(obj["nonce"]), b64d(obj["ciphertext"]), aad)
+
+
+def document_aad(record_id: str, leaf_hash: bytes, index: int) -> bytes:
+    """AAD for document ``index`` of a multi-document submission: binds it to its record and position."""
+    return record_aad(record_id, leaf_hash) + b"/document/" + str(index).encode("ascii")

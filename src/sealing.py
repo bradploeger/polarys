@@ -139,7 +139,7 @@ class DirectoryStore:
                 deks[cls] = cipher.DataKey.generate(self.provider, interval.id, cls)
                 self._write(f"keys/dek/{interval.id}/{cls}.json", json.dumps(deks[cls].wrapped_document(), indent=2).encode())
             obj = cipher.encrypt(deks[cls], rec.plaintext(), cipher.record_aad(rec.record_id, rec.leaf_hash))
-            obj.update(record_id=rec.record_id, leaf_hash=rec.leaf_hash.hex(), block_id=block.block_id)
+            obj.update(record_id=rec.record_id, leaf_hash=rec.leaf_hash.hex())
             day = interval.start.strftime("%Y/%m/%d")
             self._write(f"records/{day}/{interval.id}/{rec.record_id}.bin", json.dumps(obj).encode())
         self._write(f"trees/{block.block_id}.bin", block.tree.to_bytes())
