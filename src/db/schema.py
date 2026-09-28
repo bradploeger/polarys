@@ -5,7 +5,7 @@ block each belongs to, and where its encrypted object lives.  It never holds
 record plaintext; the object store holds only ciphertext.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 POSTGRES = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -220,3 +220,29 @@ CREATE TABLE IF NOT EXISTS index_queue (
     enqueued_at TEXT NOT NULL
 );
 """
+
+
+# Forward migrations: version -> statements that take the schema from version-1 to version.
+# The base DDL above is version 1; a fresh install applies every migration in order.
+MIGRATIONS = {
+    2: {
+        "postgres": [
+            "ALTER TABLE api_clients ADD COLUMN IF NOT EXISTS webhook_secret text",
+            "ALTER TABLE receipts ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz",
+            "ALTER TABLE receipts ADD COLUMN IF NOT EXISTS gave_up boolean NOT NULL DEFAULT false",
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS restamps integer NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS receipts_due ON receipts (next_attempt_at) WHERE delivered_at IS NULL AND NOT gave_up",
+            "CREATE INDEX IF NOT EXISTS records_awaiting_receipt ON records (block_id) "
+            "WHERE status = 'anchored' AND source_type IN ('api', 'upload')",
+        ],
+        "sqlite": [
+            "ALTER TABLE api_clients ADD COLUMN webhook_secret TEXT",
+            "ALTER TABLE receipts ADD COLUMN next_attempt_at TEXT",
+            "ALTER TABLE receipts ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE blocks ADD COLUMN restamps INTEGER NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS receipts_due ON receipts (next_attempt_at) WHERE delivered_at IS NULL AND gave_up = 0",
+            "CREATE INDEX IF NOT EXISTS records_awaiting_receipt ON records (block_id) "
+            "WHERE status = 'anchored' AND source_type IN ('api', 'upload')",
+        ],
+    },
+}

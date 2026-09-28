@@ -178,3 +178,38 @@ class StoreAndCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GenTimeOrderTests(unittest.TestCase):
+    """Block N's genTime may equal block N-1's (same second) but must not go backwards beyond accuracy."""
+
+    def chain_with_gen_times(self, offsets_seconds):
+        from datetime import timedelta
+
+        from polarys.sealing import OpenInterval, interval_bounds, seal
+
+        from helpers import T0, Clock, dev_tsa, make_record
+
+        clock = Clock(T0)
+        dev, client = dev_tsa(clock)
+        prev, out = None, []
+        for b, off in enumerate(offsets_seconds):
+            start, end = interval_bounds(T0 + timedelta(minutes=5 * b))
+            iv = OpenInterval(start, end)
+            iv.add(make_record(b, start + timedelta(seconds=1)))
+            created = T0 + timedelta(minutes=10)
+            clock.t = created + timedelta(seconds=off)
+            prev = seal(iv, block_id=b, prev=prev, provider=provider(), tsa=client, created_at=created)
+            out.append((prev.header, prev.token))
+        return verify_chain(out, provider().keyring(), [dev.ca_cert])
+
+    def test_same_second_is_valid(self):
+        self.assertTrue(self.chain_with_gen_times([0, 0, 0]).ok)
+
+    def test_within_accuracy_is_valid(self):
+        self.assertTrue(self.chain_with_gen_times([1, 0]).ok)  # dev TSA states 1 s accuracy per token
+
+    def test_backwards_beyond_accuracy_is_invalid(self):
+        rep = self.chain_with_gen_times([120, 0])
+        self.assertFalse(rep.ok)
+        self.assertTrue(any("earlier than the previous block" in e for e in rep.blocks[1].errors))

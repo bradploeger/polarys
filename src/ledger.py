@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .db import Database, Tx
-from .db.schema import POSTGRES, SCHEMA_VERSION, SQLITE
+from .db.schema import MIGRATIONS, POSTGRES, SCHEMA_VERSION, SQLITE
 from .util import parse_rfc3339, rfc3339
 
 
@@ -53,6 +53,7 @@ class ApiClient:
     roles: tuple[str, ...]
     webhook_url: str | None
     active: bool
+    webhook_secret: str | None = None
 
 
 _RECORD_COLS = (
@@ -96,20 +97,36 @@ class Ledger:
     # -- schema -------------------------------------------------------------------------
 
     def init_schema(self, now: datetime) -> Interval:
+        """Create or migrate the schema to SCHEMA_VERSION (safe to re-run), then ensure an open interval."""
         if self.pg:
             with self.db.transaction() as tx:
                 tx.execute("SELECT pg_advisory_xact_lock(7331001)")
                 for stmt in [s.strip() for s in POSTGRES.split(";") if s.strip()]:
                     tx.execute(stmt)
+                self._migrate(tx)
         else:
             self.db.executescript(SQLITE)
+            with self.db.transaction() as tx:
+                self._migrate(tx)
+        return self.ensure_open_interval(now)
+
+    def _migrate(self, tx: Tx) -> None:
+        row = tx.one("SELECT value FROM schema_meta WHERE key = 'version'")
+        version = int(row[0]) if row else 1
+        if version > SCHEMA_VERSION:
+            raise LedgerError(f"ledger schema version {version} is newer than this software ({SCHEMA_VERSION})")
+        for v in range(version + 1, SCHEMA_VERSION + 1):
+            for stmt in MIGRATIONS[v]["postgres" if self.pg else "sqlite"]:
+                tx.execute(stmt)
+        if row is None:
+            tx.execute("INSERT INTO schema_meta (key, value) VALUES ('version', %s)", (str(SCHEMA_VERSION),))
+        else:
+            tx.execute("UPDATE schema_meta SET value = %s WHERE key = 'version'", (str(SCHEMA_VERSION),))
+
+    def schema_version(self) -> int:
         with self.db.transaction() as tx:
             row = tx.one("SELECT value FROM schema_meta WHERE key = 'version'")
-            if row is None:
-                tx.execute("INSERT INTO schema_meta (key, value) VALUES ('version', %s)", (str(SCHEMA_VERSION),))
-            elif int(row[0]) != SCHEMA_VERSION:
-                raise LedgerError(f"ledger schema version {row[0]} is not supported (expected {SCHEMA_VERSION})")
-        return self.ensure_open_interval(now)
+        return int(row[0]) if row else 0
 
     def ensure_open_interval(self, now: datetime) -> Interval:
         with self.db.transaction() as tx:
@@ -261,9 +278,10 @@ class Ledger:
             "gen_time": self._dt(r[5]),
             "state": r[6],
             "interval_id": r[7],
+            "restamps": int(r[8]),
         }
 
-    _BLOCK_COLS = "block_id, header, block_hash, token, tsa_name, gen_time, state, interval_id"
+    _BLOCK_COLS = "block_id, header, block_hash, token, tsa_name, gen_time, state, interval_id, restamps"
 
     def get_block(self, block_id: int) -> dict | None:
         with self.db.transaction() as tx:
@@ -276,12 +294,117 @@ class Ledger:
         return self._block_row(r) if r else None
 
     def store_receipt(self, record_id: str, block_id: int, receipt: dict, now: datetime) -> None:
+        self.store_receipts([(record_id, block_id, receipt)], now)
+
+    def store_receipts(self, items: list[tuple[str, int, dict]], now: datetime) -> int:
+        """Insert receipts (idempotent) and mark their records ``receipted``. Delivery is due immediately."""
+        n = 0
+        with self.db.transaction() as tx:
+            for record_id, block_id, receipt in items:
+                tx.execute(
+                    "INSERT INTO receipts (record_id, block_id, receipt, created_at, next_attempt_at) "
+                    f"VALUES (%s, %s, {self.J}, %s, %s) ON CONFLICT DO NOTHING",
+                    (record_id, block_id, json.dumps(receipt), self._t(now), self._t(now)),
+                )
+                n += tx.rowcount
+                tx.execute("UPDATE records SET status = 'receipted' WHERE record_id = %s", (record_id,))
+        return n
+
+    # -- sealer queries -------------------------------------------------------------------
+
+    def blocks_in_state(self, state: str) -> list[dict]:
+        with self.db.transaction() as tx:
+            rows = tx.execute(f"SELECT {self._BLOCK_COLS} FROM blocks WHERE state = %s ORDER BY block_id", (state,))
+        return [self._block_row(r) for r in rows]
+
+    def blocks_range(self, first: int | None = None, last: int | None = None) -> list[dict]:
+        with self.db.transaction() as tx:
+            rows = tx.execute(
+                f"SELECT {self._BLOCK_COLS} FROM blocks WHERE block_id >= %s AND block_id <= %s ORDER BY block_id",
+                (first if first is not None else 0, last if last is not None else 2**62),
+            )
+        return [self._block_row(r) for r in rows]
+
+    def restamp_block(self, block_id: int, header: dict, block_hash: bytes) -> None:
+        """Replace the header of a block that has not been anchored yet (see Sealer.anchor)."""
         with self.db.transaction() as tx:
             tx.execute(
-                f"INSERT INTO receipts (record_id, block_id, receipt, created_at) VALUES (%s, %s, {self.J}, %s) ON CONFLICT DO NOTHING",
-                (record_id, block_id, json.dumps(receipt), self._t(now)),
+                f"UPDATE blocks SET header = {self.J}, block_hash = %s, block_uuid = %s, created_at = %s, restamps = restamps + 1 "
+                "WHERE block_id = %s AND state = 'sealed' AND token IS NULL",
+                (json.dumps(header), block_hash, header["block_uuid"], self._t(parse_rfc3339(header["created_at"])), block_id),
             )
-            tx.execute("UPDATE records SET status = 'receipted' WHERE record_id = %s", (record_id,))
+            if tx.rowcount != 1:
+                raise LedgerError(f"block {block_id} is anchored or missing and cannot be re-stamped")
+
+    def block_records(self, block_id: int) -> list[dict]:
+        with self.db.transaction() as tx:
+            rows = tx.execute(f"SELECT {_RECORD_COLS} FROM records WHERE block_id = %s ORDER BY leaf_index", (block_id,))
+        return [self._record_row(r) for r in rows]
+
+    def blocks_awaiting_receipts(self, sources: tuple[str, ...]) -> list[int]:
+        marks = ", ".join(["%s"] * len(sources))
+        with self.db.transaction() as tx:
+            rows = tx.execute(
+                f"SELECT DISTINCT block_id FROM records WHERE status = 'anchored' AND source_type IN ({marks}) ORDER BY block_id",
+                sources,
+            )
+        return [int(r[0]) for r in rows]
+
+    def records_missing_receipts(self, block_id: int, sources: tuple[str, ...]) -> list[dict]:
+        marks = ", ".join(["%s"] * len(sources))
+        with self.db.transaction() as tx:
+            rows = tx.execute(
+                f"SELECT {', '.join('r.' + c.strip() for c in _RECORD_COLS.split(','))} FROM records r "
+                f"LEFT JOIN receipts x ON x.record_id = r.record_id "
+                f"WHERE r.block_id = %s AND r.source_type IN ({marks}) AND x.record_id IS NULL ORDER BY r.leaf_index",
+                (block_id, *sources),
+            )
+        return [self._record_row(r) for r in rows]
+
+    # -- webhook delivery -------------------------------------------------------------------
+
+    def due_deliveries(self, now: datetime, limit: int = 100) -> list[dict]:
+        not_gave_up = "NOT x.gave_up" if self.pg else "x.gave_up = 0"
+        with self.db.transaction() as tx:
+            rows = tx.execute(
+                "SELECT x.record_id, x.receipt, x.created_at, x.delivery_attempts, c.webhook_url, c.webhook_secret, c.key_id "
+                "FROM receipts x JOIN records r ON r.record_id = x.record_id JOIN api_clients c ON c.key_id = r.api_key_id "
+                f"WHERE x.delivered_at IS NULL AND {not_gave_up} AND x.next_attempt_at <= %s AND c.webhook_url IS NOT NULL "
+                "ORDER BY x.next_attempt_at LIMIT %s",
+                (self._t(now), limit),
+            )
+        return [
+            {"record_id": self._s(r[0]), "receipt": self._json(r[1]), "created_at": self._dt(r[2]), "attempts": int(r[3]),
+             "url": r[4], "secret": r[5], "key_id": r[6]}
+            for r in rows
+        ]
+
+    def mark_delivered(self, record_id: str, now: datetime) -> None:
+        with self.db.transaction() as tx:
+            tx.execute(
+                "UPDATE receipts SET delivered_at = %s, delivery_attempts = delivery_attempts + 1, last_error = NULL WHERE record_id = %s",
+                (self._t(now), record_id),
+            )
+
+    def mark_delivery_failed(self, record_id: str, error: str, next_attempt_at: datetime | None) -> None:
+        """Record a failed attempt; ``next_attempt_at=None`` means give up."""
+        with self.db.transaction() as tx:
+            tx.execute(
+                "UPDATE receipts SET delivery_attempts = delivery_attempts + 1, last_error = %s, next_attempt_at = %s, gave_up = %s "
+                "WHERE record_id = %s",
+                (error[:500], self._t(next_attempt_at), (next_attempt_at is None) if self.pg else int(next_attempt_at is None), record_id),
+            )
+
+    def delivery_status(self, record_id: str) -> dict | None:
+        with self.db.transaction() as tx:
+            r = tx.one(
+                "SELECT delivered_at, delivery_attempts, last_error, next_attempt_at, gave_up FROM receipts WHERE record_id = %s",
+                (record_id,),
+            )
+        if not r:
+            return None
+        return {"delivered_at": self._dt(r[0]), "attempts": int(r[1]), "last_error": r[2],
+                "next_attempt_at": self._dt(r[3]), "gave_up": bool(r[4])}
 
     def get_receipt(self, record_id: str) -> dict | None:
         with self.db.transaction() as tx:
@@ -294,20 +417,20 @@ class Ledger:
         with self.db.transaction() as tx:
             tx.execute(
                 "INSERT INTO api_clients (key_id, secret_hash, submitter_type, submitter_id, display_name, auth_method, "
-                f"allowed_sources, allowed_classes, roles, webhook_url, active, created_at) VALUES "
-                f"(%s, %s, %s, %s, %s, %s, {self.J}, {self.J}, {self.J}, %s, %s, %s)",
+                f"allowed_sources, allowed_classes, roles, webhook_url, active, created_at, webhook_secret) VALUES "
+                f"(%s, %s, %s, %s, %s, %s, {self.J}, {self.J}, {self.J}, %s, %s, %s, %s)",
                 (c.key_id, c.secret_hash, c.submitter_type, c.submitter_id, c.display_name, c.auth_method,
                  json.dumps(list(c.allowed_sources)), json.dumps(list(c.allowed_classes)) if c.allowed_classes is not None else None,
-                 json.dumps(list(c.roles)), c.webhook_url, c.active if self.pg else int(c.active), self._t(now)),
+                 json.dumps(list(c.roles)), c.webhook_url, c.active if self.pg else int(c.active), self._t(now), c.webhook_secret),
             )
 
     _CLIENT_COLS = ("key_id, secret_hash, submitter_type, submitter_id, display_name, auth_method, allowed_sources, "
-                    "allowed_classes, roles, webhook_url, active")
+                    "allowed_classes, roles, webhook_url, active, webhook_secret")
 
     def _client_row(self, r) -> ApiClient:
         classes = self._json(r[7])
         return ApiClient(r[0], bytes(r[1]), r[2], r[3], r[4], r[5], tuple(self._json(r[6])),
-                         tuple(classes) if classes is not None else None, tuple(self._json(r[8])), r[9], bool(r[10]))
+                         tuple(classes) if classes is not None else None, tuple(self._json(r[8])), r[9], bool(r[10]), r[11])
 
     def get_client(self, key_id: str) -> ApiClient | None:
         with self.db.transaction() as tx:

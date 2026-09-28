@@ -216,6 +216,33 @@ class ApiContract:
         self.assertEqual(self.api.get("/v1/blocks/0", headers=self.h(self.auditor)).json()["header"], block.header)
         self.assertEqual(self.api.get("/v1/blocks/9", headers=self.h(self.auditor)).status_code, 404)
 
+    def test_verify_chain_endpoint(self):
+        from polarys.sealer import Sealer
+
+        clock = Clock(utcnow())
+        dev, client = dev_tsa(clock)
+        self.svc.tsa_trust_roots = [dev.ca_cert]
+        sealer = Sealer(self.ledger, self.svc.store, provider(), client, self.svc.reader, clock=clock)
+        for _ in range(3):
+            self.post(self.alice, {"record_class": "correspondence", "text": "x"})
+            clock.t += timedelta(minutes=5)
+            sealer.run_cycle()
+        r = self.api.post("/v1/audit/verify-chain", json={}, headers=self.h(self.auditor))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((r.json()["ok"], r.json()["blocks_checked"]), (True, 3))
+        r = self.api.post("/v1/audit/verify-chain", json={"from": 1, "to": 2}, headers=self.h(self.auditor))
+        self.assertEqual((r.json()["ok"], [b["block_id"] for b in r.json()["blocks"]]), (True, [1, 2]))
+        self.assertEqual(self.api.post("/v1/audit/verify-chain", json={}, headers=self.h(self.alice)).status_code, 403)
+        self.assertEqual(self.api.post("/v1/audit/verify-chain", json={"from": -1}, headers=self.h(self.auditor)).status_code, 422)
+        # Tamper with a stored header: the audit reports it.
+        b1 = self.ledger.get_block(1)
+        forged = dict(b1["header"], entry_count=2)
+        with self.ledger.db.transaction() as tx:
+            tx.execute(f"UPDATE blocks SET header = {self.ledger.J} WHERE block_id = 1", (__import__("json").dumps(forged),))
+        body = self.api.post("/v1/audit/verify-chain", json={}, headers=self.h(self.auditor)).json()
+        self.assertFalse(body["ok"])
+        self.assertIn("sealer signature does not verify", body["blocks"][1]["errors"])
+
     def test_health(self):
         self.assertEqual(self.api.get("/healthz").json()["status"], "ok")
         r = self.api.get("/readyz").json()

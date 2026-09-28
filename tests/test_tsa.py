@@ -69,6 +69,18 @@ class TokenTests(unittest.TestCase):
             with self.assertRaises(TimestampError, msg=f"byte {pos}"):
                 verify_token(bytes(bad), DIGEST, trust_roots=[self.tsa.ca_cert])
 
+    def test_bundle_with_unparseable_certificate_still_loads(self):
+        from cryptography.hazmat.primitives import serialization
+
+        from polarys.tsa import load_certificates
+
+        good = self.tsa.ca_cert.public_bytes(serialization.Encoding.PEM)
+        junk = b"-----BEGIN CERTIFICATE-----\nMIIBbroken\n-----END CERTIFICATE-----\n"
+        certs = load_certificates(junk + good + b"# comment\n" + good)
+        self.assertEqual(len(certs), 2)
+        info = verify_token(self.issue(), DIGEST, trust_roots=certs)
+        self.assertTrue(info.chain_verified)
+
     def test_refusal_is_reported(self):
         refused = der.seq(der.seq(der.integer(2), der.seq(der.tlv(0x0C, b"policy not supported"))))
         with self.assertRaisesRegex(TimestampError, "rejection.*policy not supported"):

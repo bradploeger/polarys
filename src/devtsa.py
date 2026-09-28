@@ -79,6 +79,28 @@ class DevTSA:
         )
         return cls(ca_key, ca_cert, tsa_key, tsa_cert, clock)
 
+    @classmethod
+    def load_or_create(cls, directory, clock=None) -> "DevTSA":
+        """Keep the development TSA's CA and signing key in ``directory`` so tokens verify across restarts."""
+        from pathlib import Path
+
+        d = Path(directory)
+        names = ("ca.pem", "ca.key", "tsa.pem", "tsa.key")
+        if all((d / n).exists() for n in names):
+            load_key = lambda n: serialization.load_pem_private_key((d / n).read_bytes(), password=None)  # noqa: E731
+            return cls(load_key("ca.key"), x509.load_pem_x509_certificate((d / "ca.pem").read_bytes()),
+                       load_key("tsa.key"), x509.load_pem_x509_certificate((d / "tsa.pem").read_bytes()), clock)
+        dev = cls.create(clock=clock)
+        d.mkdir(parents=True, exist_ok=True)
+        pem_key = lambda k: k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,  # noqa: E731
+                                            serialization.NoEncryption())
+        (d / "ca.pem").write_bytes(dev.ca_pem())
+        (d / "tsa.pem").write_bytes(dev.tsa_cert.public_bytes(serialization.Encoding.PEM))
+        for n, k in (("ca.key", dev.ca_key), ("tsa.key", dev.tsa_key)):
+            (d / n).write_bytes(pem_key(k))
+            (d / n).chmod(0o600)
+        return dev
+
     def ca_pem(self) -> bytes:
         return self.ca_cert.public_bytes(serialization.Encoding.PEM)
 

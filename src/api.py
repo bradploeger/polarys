@@ -12,6 +12,7 @@ GET  /v1/records/{id}               status of a record
 GET  /v1/records/{id}/receipt       receipt: 202 until the block is anchored, then 200
 GET  /v1/blocks/latest              chain head                     auditor role
 GET  /v1/blocks/{id}                block header and token         auditor role
+POST /v1/audit/verify-chain         verify a block range           auditor role
 GET  /.well-known/log-keys.json     public keys                    no authentication
 GET  /healthz, /readyz
 """
@@ -51,6 +52,7 @@ from .util import b64e, rfc3339, utcnow
 
 TOKEN_PREFIX = "plk_"
 ELEVATED_ATTRIBUTES = {"permanent", "exposure_record"}  # attributes that lengthen retention
+MAX_VERIFY_BLOCKS = 10_000
 
 
 # --------------------------------------------------------------------------
@@ -136,6 +138,7 @@ class Services:
     provider: KeyProvider
     ingestor: Ingestor
     reader: RecordReader
+    tsa_trust_roots: list | None = None
 
 
 class ApiError(Exception):
@@ -373,6 +376,30 @@ def create_app(svc: Services) -> Starlette:
             raise ApiError(404, "not_found", "no such block")
         return JSONResponse(block_body(b))
 
+    async def verify_chain_endpoint(request: Request) -> Response:
+        client = await authenticate(request)
+        if "auditor" not in client.roles:
+            raise ApiError(403, "forbidden", "the auditor role is required")
+        body = await read_json(request, 4096)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_request", "body must be a JSON object")
+        first, last = body.get("from"), body.get("to")
+        for v in (first, last):
+            if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < 0):
+                raise ApiError(422, "invalid_request", "from and to must be non-negative block ids")
+        latest = await run_in_threadpool(svc.ledger.latest_block)
+        top = latest["block_id"] if latest else -1
+        first = 0 if first is None else first
+        last = top if last is None else min(last, top)
+        if last - first + 1 > MAX_VERIFY_BLOCKS:
+            raise ApiError(422, "range_too_large", f"verify at most {MAX_VERIFY_BLOCKS} blocks per request")
+        from .service import verify_ledger_chain
+
+        roots = svc.tsa_trust_roots
+        res = await run_in_threadpool(verify_ledger_chain, svc.ledger, svc.provider.keyring(), roots, first, last,
+                                      bool(body.get("check_leaves", True)))
+        return JSONResponse(res.to_dict())
+
     async def well_known_keys(request: Request) -> Response:
         return JSONResponse(svc.provider.keyring().to_document(), headers={"Cache-Control": "public, max-age=300"})
 
@@ -409,6 +436,7 @@ def create_app(svc: Services) -> Starlette:
         Route("/v1/records/{record_id}", wrap(get_record), methods=["GET"]),
         Route("/v1/records/{record_id}/receipt", wrap(get_receipt), methods=["GET"]),
         Route("/v1/blocks/{block_ref}", wrap(get_block), methods=["GET"]),
+        Route("/v1/audit/verify-chain", wrap(verify_chain_endpoint), methods=["POST"]),
         Route("/.well-known/log-keys.json", well_known_keys, methods=["GET"]),
         Route("/healthz", healthz, methods=["GET"]),
         Route("/readyz", readyz, methods=["GET"]),
@@ -435,7 +463,14 @@ def build_services(settings: Settings) -> Services:
         max_submission_bytes=settings.max_submission_bytes,
         tx_batch=settings.tx_batch,
     )
-    return Services(settings, ledger, store, provider, ingestor, RecordReader(ledger, store, provider))
+    from .service import trust_roots
+
+    roots = trust_roots(settings)
+    if roots is None and settings.tsa_mode == "dev":
+        from .devtsa import DevTSA
+
+        roots = [DevTSA.load_or_create(settings.dev_tsa_dir).ca_cert]
+    return Services(settings, ledger, store, provider, ingestor, RecordReader(ledger, store, provider), roots)
 
 
 def app_from_env() -> Starlette:

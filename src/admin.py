@@ -74,10 +74,13 @@ def client():
 @click.option("--source", "sources", multiple=True, type=click.Choice(["api", "windows_event"]), help="Allowed source types (default: api).")
 @click.option("--class", "classes", multiple=True, help="Restrict to these record classes (default: any).")
 @click.option("--role", "roles", multiple=True, type=click.Choice(["submitter", "auditor", "records_manager"]), help="Roles (default: submitter).")
-@click.option("--webhook", help="Receipt webhook URL (used from Phase 3).")
+@click.option("--webhook", help="HTTPS URL that receives receipts as soon as they are issued.")
 def client_add(upn, fqdn, display_name, sources, classes, roles, webhook):
-    """Create an API key and print it once."""
+    """Create an API key (and webhook secret) and print them once."""
+    import secrets
+
     from .api import new_api_key
+    from .delivery import check_webhook_url
 
     if bool(upn) == bool(fqdn):
         raise click.UsageError("give exactly one of --user or --device")
@@ -86,6 +89,13 @@ def client_add(upn, fqdn, display_name, sources, classes, roles, webhook):
     except IdentityError as e:
         raise click.UsageError(str(e)) from None
     s = _settings()
+    webhook_secret = None
+    if webhook:
+        try:
+            check_webhook_url(webhook, s.allow_http_webhooks)
+        except ValueError as e:
+            raise click.UsageError(str(e)) from None
+        webhook_secret = "whsec_" + secrets.token_urlsafe(32)
     if classes:
         from .classes import ClassRegistry
 
@@ -98,10 +108,13 @@ def client_add(upn, fqdn, display_name, sources, classes, roles, webhook):
     key_id, token, secret_hash = new_api_key()
     _ledger(s).add_client(
         ApiClient(key_id, secret_hash, sub.type, sub.id, display_name, "api-key",
-                  tuple(sources) or ("api",), tuple(classes) or None, tuple(roles) or ("submitter",), webhook, True),
+                  tuple(sources) or ("api",), tuple(classes) or None, tuple(roles) or ("submitter",), webhook, True,
+                  webhook_secret),
         utcnow(),
     )
     click.echo(f"API key for {sub.type} {sub.id} (key id {key_id}). Store it now; it is not shown again:\n\n  {token}\n")
+    if webhook_secret:
+        click.echo(f"Webhook signing secret for {webhook}:\n\n  {webhook_secret}\n")
 
 
 @client.command("list")
@@ -157,6 +170,107 @@ def status():
     if isinstance(store, SpoolingStore):
         out["spool_pending_objects"] = len(store.pending())
     click.echo(json.dumps(out, indent=2))
+
+
+@main.group()
+def sealer():
+    """The 5-minute sealer (run exactly one leader; extra instances wait as standbys)."""
+
+
+def _logging(level: str) -> None:
+    import logging
+
+    logging.basicConfig(level=getattr(logging, level.upper()), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+@sealer.command("run")
+@click.option("--log-level", default="info", show_default=True)
+def sealer_run(log_level):
+    """Seal at every boundary and deliver webhooks until stopped (SIGTERM / Ctrl-C)."""
+    import signal
+
+    from .service import build_sealer_service
+
+    _logging(log_level)
+    service, _ = build_sealer_service(_settings())
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: service.stop.set())
+    service.run()
+
+
+@sealer.command("once")
+@click.option("--no-close", is_flag=True, help="Only finish pending work; do not close the open interval.")
+@click.option("--log-level", default="warning", show_default=True)
+def sealer_once(no_close, log_level):
+    """Run one sealing cycle now (refuses if another sealer holds the lock)."""
+    from .service import build_sealer_service
+
+    _logging(log_level)
+    service, _ = build_sealer_service(_settings())
+    if not service.lock.acquire():
+        raise click.ClickException("another sealer holds the leader lock")
+    try:
+        rep = service.sealer.run_cycle(freeze=not no_close)
+        deliveries = service.deliverer.run_once()
+    finally:
+        service.lock.release()
+    click.echo(json.dumps({**rep.to_dict(), "webhooks": deliveries.__dict__}, indent=2))
+    sys.exit(1 if rep.errors else 0)
+
+
+@main.command()
+def deliver():
+    """Deliver due receipt webhooks once."""
+    from datetime import timedelta
+
+    from .delivery import Deliverer
+
+    s = _settings()
+    rep = Deliverer(_ledger(s), timeout=s.webhook_timeout_seconds, retry_window=timedelta(hours=s.webhook_retry_hours),
+                    allow_http=s.allow_http_webhooks).run_once()
+    click.echo(json.dumps(rep.__dict__))
+
+
+@main.group()
+def chain():
+    """Chain audit."""
+
+
+@chain.command("verify")
+@click.option("--from", "first", type=int, default=None)
+@click.option("--to", "last", type=int, default=None)
+@click.option("--no-leaves", is_flag=True, help="Skip recomputing Merkle roots from the ledger's leaf hashes.")
+@click.option("--json", "as_json", is_flag=True)
+def chain_verify(first, last, no_leaves, as_json):
+    """Verify signatures, hash links, timestamp tokens and Merkle roots of the stored chain."""
+    from .keys import LocalKeyProvider
+    from .service import trust_roots, verify_ledger_chain
+
+    s = _settings()
+    ring = LocalKeyProvider(s.keystore_dir, s.passphrase()).keyring()
+    roots = trust_roots(s)
+    if roots is None and s.tsa_mode == "dev":
+        from .devtsa import DevTSA
+
+        roots = [DevTSA.load_or_create(s.dev_tsa_dir).ca_cert]
+    res = verify_ledger_chain(_ledger(s), ring, roots, first, last, check_leaves=not no_leaves)
+    if as_json:
+        click.echo(json.dumps(res.to_dict(), indent=2))
+    else:
+        for b in res.report.blocks:
+            mark = click.style("PASS" if not b.errors else "FAIL", fg="green" if not b.errors else "red", bold=True)
+            click.echo(f"  {mark}  block {b.block_id:<7} {b.gen_time:%Y-%m-%d %H:%M:%SZ}  {b.tsa or ''}" if b.gen_time
+                       else f"  {mark}  block {b.block_id}")
+            for e in b.errors:
+                click.echo(f"          error: {e}")
+        for e in res.report.errors:
+            click.echo(f"  error: {e}")
+        if res.unanchored:
+            click.echo(f"  waiting for a timestamp: blocks {res.unanchored}")
+        for w in sorted({w for b in res.report.blocks for w in b.warnings}):
+            click.echo(f"  WARN  {w}")
+        click.echo(("VALID" if res.ok else "INVALID") + f": {res.checked} anchored block(s) checked")
+    sys.exit(0 if res.ok else 1)
 
 
 @main.group()

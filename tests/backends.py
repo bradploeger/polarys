@@ -20,6 +20,11 @@ from polarys.util import utcnow
 
 PG_DSN = os.environ.get("POLARYS_TEST_PG_DSN")
 
+import logging  # noqa: E402
+
+logging.getLogger("polarys").addHandler(logging.NullHandler())  # expected failures in tests are not printed
+logging.getLogger("polarys").propagate = False
+
 
 def backend_names() -> list[str]:
     return ["sqlite"] + (["postgres"] if PG_DSN else [])

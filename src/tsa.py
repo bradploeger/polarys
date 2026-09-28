@@ -442,9 +442,30 @@ def _verify_token(token, digest, nonce, trust_roots, intermediates) -> Timestamp
 
 
 def load_certificates(pem_or_der: bytes) -> list[x509.Certificate]:
-    if b"-----BEGIN" in pem_or_der:
-        return x509.load_pem_x509_certificates(pem_or_der)
-    return [x509.load_der_x509_certificate(pem_or_der)]
+    """Load a PEM bundle (skipping any certificate that does not parse) or a single DER certificate.
+
+    System trust bundles can contain certificates that newer ``cryptography`` releases reject
+    (for example a non-positive serial number); one bad entry must not make the bundle unusable.
+    """
+    if b"-----BEGIN" not in pem_or_der:
+        return [x509.load_der_x509_certificate(pem_or_der)]
+    import warnings
+
+    end = b"-----END CERTIFICATE-----"
+    certs = []
+    for chunk in pem_or_der.split(end)[:-1]:
+        start = chunk.find(b"-----BEGIN CERTIFICATE-----")
+        if start < 0:
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                certs.append(x509.load_pem_x509_certificate(chunk[start:] + end + b"\n"))
+        except ValueError:
+            continue
+    if not certs:
+        raise ValueError("no certificates found")
+    return certs
 
 
 # --------------------------------------------------------------------------

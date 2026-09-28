@@ -168,6 +168,11 @@ def verify_block(
     return chk, info
 
 
+def _accuracy(info: TimestampInfo) -> timedelta:
+    """A token's stated accuracy; one second when the TSA does not state it."""
+    return timedelta(seconds=info.accuracy_seconds if info.accuracy_seconds is not None else 1)
+
+
 def verify_chain(
     blocks: list[tuple[dict, bytes | None]],
     keyring: KeyRing,
@@ -180,7 +185,7 @@ def verify_chain(
     if not blocks:
         report.errors.append("no blocks to verify")
         return report
-    prev_header, prev_token, prev_gen = None, None, None
+    prev_header, prev_token, prev_info = None, None, None
     for header, token in blocks:
         chk, info = verify_block(header, token, keyring, trust_roots, (leaves_by_block or {}).get(header.get("block_id")))
         bid = header.get("block_id")
@@ -199,10 +204,12 @@ def verify_chain(
                 chk.errors.append("previous block header is not signed")
             if prev_token is None or header.get("prev_timestamp_token") != b64e(prev_token):
                 chk.errors.append("prev_timestamp_token does not match the previous block's token")
-            if info and prev_gen and info.gen_time <= prev_gen:
-                chk.errors.append("TSA genTime is not later than the previous block's")
+            if info and prev_info and info.gen_time < prev_info.gen_time - _accuracy(prev_info) - _accuracy(info):
+                # The hash chain fixes the order; genTimes only need to agree with it within the TSAs'
+                # stated accuracy (two blocks anchored in the same second are legitimate).
+                chk.errors.append("TSA genTime is earlier than the previous block's, beyond the TSAs' stated accuracy")
             if parse_rfc3339(header["interval"]["start"]) < parse_rfc3339(prev_header["interval"]["end"]):
                 chk.errors.append("interval overlaps the previous block's interval")
         report.blocks.append(chk)
-        prev_header, prev_token, prev_gen = header, token, (info.gen_time if info else None)
+        prev_header, prev_token, prev_info = header, token, info
     return report
